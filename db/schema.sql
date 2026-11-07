@@ -66,3 +66,9 @@ CREATE TABLE meetings (
 
 CREATE INDEX ON sections (subject_code, course_number);
 CREATE INDEX ON meetings (term_code, day_of_week, start_time, end_time);
+
+ALTER TABLE sections ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+
+ALTER TABLE sections ADD COLUMN IF NOT EXISTS analyzing_diversity BOOLEAN;
+ALTER TABLE sections ADD COLUMN IF NOT EXISTS crosslist_max_enrollment INT;
+ALTER TABLE sections ADD COLUMN IF NOT EXISTS crosslist_enrolled INT;
