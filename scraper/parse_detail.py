@@ -1,3 +1,13 @@
+"""Turn one Rice section detail page into a dict the loader can store.
+
+A detail page is the response to ``p_action=COURSE`` for one CRN. The
+heading looks like ``ASIA 104 001 (CRN: 26861)``. Labeled facts sit in
+``<b>Label:</b> value`` blocks. Meetings are free text such as
+``4:00PM - 5:15PM MW (11-JAN-2027 - 23-APR-2027)`` and are expanded into
+one row per weekday. Anything the parser does not understand is collected
+in ``warnings`` and still returned; only a missing section heading raises.
+"""
+
 import re
 import warnings
 from datetime import datetime
@@ -5,15 +15,23 @@ from urllib.parse import urlparse, parse_qs
 
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
+# Rice serves XHTML. Parsing it with the HTML parser is intentional.
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+# Rice day letters. R is Thursday and U is Sunday; there is no "H" or "T" for those.
 DAY_NUM = {"M": 1, "T": 2, "W": 3, "R": 4, "F": 5, "S": 6, "U": 7}
+# "4:00PM - 5:15PM MW" -> start, end, day letters.
 MEETING_RE = re.compile(
     r"(\d{1,2}:\d{2}[AP]M)\s*-\s*(\d{1,2}:\d{2}[AP]M)\s+([A-Z]+)")
+# "(11-JAN-2027 - 23-APR-2027)" -> start date, end date.
 DATES_RE = re.compile(
     r"\((\d{1,2}-[A-Z]{3}-\d{4})\s*-\s*(\d{1,2}-[A-Z]{3}-\d{4})\)")
+# "ASIA 104 001 (CRN: 26861)" -> subject, number, section, crn.
 HEADER_RE = re.compile(r"^(\S+)\s+(\S+)\s+(\S+)\s+\(CRN:\s*(\d+)\)")
 
+# Labels the page is known to use. Any other <b> label is kept in the
+# field map and also recorded as a warning, so a new Rice field is visible
+# in the crawl log without crashing the parse.
 KNOWN_LABELS = {
     "Long Title", "Department", "Instructor", "Meeting", "Part of Term",
     "Grade Mode", "Course Type", "Language of Instruction",
@@ -27,20 +45,33 @@ KNOWN_LABELS = {
 
 
 def _date(s):
+    """Parse a Rice date like ``11-JAN-2027`` into a ``datetime.date``."""
     return datetime.strptime(s, "%d-%b-%Y").date()
 
 
 def _time(s):
+    """Parse a Rice time like ``4:00PM`` into a ``datetime.time``."""
     return datetime.strptime(s, "%I:%M%p").time()
 
 
 def _int(s):
+    """Return the leading integer in ``s``, or None when there is none.
+
+    Enrollment text is sometimes a bare number and sometimes a note such
+    as ``0 (permission required)``. Only the leading digits are the count.
+    """
     m = re.match(r"\s*(\d+)", s or "")
     return int(m.group(1)) if m else None
 
 
 def _fields(soup):
-    """Every <div><b>Label: </b>value</div> pair on the page."""
+    """Map every bold label on the page to its value string.
+
+    Most facts are ``<div><b>Label: </b>value</div>``: the value is the
+    parent's text with the label stripped off. Restrictions and the plural
+    Instructors block put their value in the next sibling ``div``, and
+    that sibling's lines are joined with ``"; "``.
+    """
     out = {}
     for b in soup.find_all("b"):
         label = b.get_text(" ", strip=True).rstrip(":").strip()
@@ -59,6 +90,12 @@ def _fields(soup):
 
 
 def _meeting_text(soup):
+    """Return the raw Meeting block, with line breaks preserved.
+
+    Line breaks matter: each schedule line is parsed separately, and a
+    section can have more than one (a lecture and a lab, or a date range
+    that changes mid-term). Returns ``""`` when the page has no Meeting label.
+    """
     for b in soup.find_all("b"):
         label = b.get_text(strip=True)
         if label.startswith("Meeting"):
@@ -67,6 +104,16 @@ def _meeting_text(soup):
 
 
 def _parse_meetings(text, default_start, default_end, warns):
+    """Expand meeting text into one dict per weekday.
+
+    Each line may carry its own ``(start - end)`` date range. A line
+    without one uses ``default_start`` and ``default_end``, which are the
+    dates from the first range found anywhere in the block. Day letters
+    are split, so ``MW`` becomes Monday and Wednesday at the same times.
+    An unknown letter is skipped and appended to ``warns``. A line that
+    contains a clock time but does not match the pattern is also a warning,
+    so a new layout is noticed instead of dropped silently.
+    """
     meetings = []
     for line in text.splitlines():
         dm = DATES_RE.search(line)
@@ -89,6 +136,13 @@ def _parse_meetings(text, default_start, default_end, warns):
 
 
 def _instructors(soup):
+    """Return ``{"key", "netid", "name"}`` for each instructor on the page.
+
+    A linked name carries ``p_netid`` in the href, and that netid is the
+    key. A label with no link, such as plain-text ``Staff``, is stored
+    with ``netid`` None and key ``name:<text>``. Both the singular
+    Instructor label and the plural Instructors label are accepted.
+    """
     out = []
     for b in soup.find_all("b"):
         if b.get_text(strip=True).startswith("Instructor"):
@@ -106,6 +160,24 @@ def _instructors(soup):
 
 
 def parse_detail(html: str) -> dict:
+    """Parse a section detail page into the dict ``upsert_section`` expects.
+
+    Raises ``ValueError`` when ``#rice-upflow-data h2`` is not a section
+    heading, which is how a form page or an error page is rejected.
+
+    Identity comes from the heading and from ``<body term="...">``.
+    ``subject_code`` prefers the ``data-subject-code`` attribute, then the
+    heading. Dates are the first range inside the Meeting block. Enrollment
+    keeps both the leading integer and the original note; ``permission_required``
+    is true when that note mentions permission. Waitlist text like
+    ``0 (Max 99)`` splits into the current count and the max. Analyzing
+    Diversity is true when its value starts with ``y``. Cross-list counts
+    are None when those labels are absent.
+
+    ``warnings`` lists unknown labels, unparsed meeting lines, unknown day
+    letters, and an instructor label that yielded no name. The caller logs
+    them; they do not fail the parse.
+    """
     soup = BeautifulSoup(html, "lxml")
     root = soup.find(id="rice-upflow-data")
     h2 = root.find("h2") if root else None
@@ -120,11 +192,13 @@ def parse_detail(html: str) -> dict:
             warns.append(f"unknown field: {label!r} = {f[label]!r}")
 
     mtext = _meeting_text(soup)
+    # Section-level dates: the first range in the whole meeting block.
     dm = DATES_RE.search(mtext)
     start = _date(dm.group(1)) if dm else None
     end = _date(dm.group(2)) if dm else None
 
     max_txt = f.get("Section Max Enrollment")
+    # "3 (Max 99)" -> currently waitlisted, waitlist capacity.
     wl = re.search(r"(\d+)\s*\(Max\s*(\d+)\)", f.get("Waitlisted") or "")
     as_of = f.get("Enrollment data as of")
     h3 = root.find("h3")

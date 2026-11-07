@@ -1,7 +1,22 @@
+"""Write parsed schedule data into Postgres.
+
+``connect`` opens the database named by ``DATABASE_URL``. ``upsert_subjects``
+refreshes the subject catalog. ``upsert_section`` writes one section and
+replaces its meetings and instructor links. ``mark_inactive`` flags sections
+that a finished full crawl no longer saw.
+
+The caller owns transactions: these functions execute and return, and do
+not commit. ``embedding`` is intentionally absent from the section write,
+so a later re-upsert leaves any stored vector in place.
+"""
+
 import os
 
 import psycopg
 
+# Columns copied from a parse_detail() dict into the sections table.
+# term_code and crn are the primary key and are not overwritten on conflict.
+# scraped_at and is_active are set in the SQL, not taken from the dict.
 SECTION_COLS = [
     "term_code", "crn", "subject_code", "course_number", "section_no",
     "title", "long_title", "description", "department", "part_of_term",
@@ -15,11 +30,20 @@ SECTION_COLS = [
 
 
 def connect():
-    # e.g. postgresql://planner:planner@localhost:5433/rice_planner
+    """Open a connection using ``DATABASE_URL``.
+
+    Example: ``postgresql://planner:planner@localhost:5433/rice_planner``.
+    The caller should use the connection as a context manager so it closes.
+    """
     return psycopg.connect(os.environ["DATABASE_URL"])
 
 
 def upsert_subjects(conn, subjects: list[dict]):
+    """Insert each ``{"code", "name"}`` subject, updating the name on conflict.
+
+    Does not commit. A subject that disappears from a later form page is
+    left in the table; only the name of a known code is refreshed.
+    """
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO subjects (code, name) VALUES (%s, %s) "
@@ -29,14 +53,28 @@ def upsert_subjects(conn, subjects: list[dict]):
 
 
 def upsert_section(cur, d: dict):
-    """Insert or update one parsed section with its meetings and instructors.
-    Meetings and instructor links are replaced wholesale, so a changed
-    schedule never leaves stale rows behind."""
+    """Insert or update one parsed section, then replace its child rows.
+
+    ``d`` is the dict returned by ``parse_detail``. The section row is
+    matched on ``(term_code, crn)``. A repeat crawl overwrites every other
+    column, sets ``scraped_at`` to now, and marks the section active again.
+
+    Meetings and ``section_instructors`` rows for this section are deleted
+    and inserted again. Replacing them wholesale means a schedule change
+    cannot leave a stale weekday or instructor behind. Instructor people
+    are upserted by key (netid, or ``name:<name>`` when there is no netid);
+    the link row is inserted only if that section does not already point
+    at that instructor.
+
+    Uses the cursor it is given and does not commit or roll back.
+    """
     d = dict(d)
-    d["meeting_raw"] = " ".join((d["meeting_raw"] or "").split())  # fix nbsp
+    # Collapse whitespace, including non-breaking spaces, to single spaces.
+    d["meeting_raw"] = " ".join((d["meeting_raw"] or "").split())
 
     cols = ", ".join(SECTION_COLS)
     vals = ", ".join(f"%({c})s" for c in SECTION_COLS)
+    # The primary key is the conflict target, so it is not assigned again.
     updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in SECTION_COLS
                         if c not in ("term_code", "crn"))
     cur.execute(
@@ -76,7 +114,13 @@ def upsert_section(cur, d: dict):
 
 
 def mark_inactive(conn, term: str, keep_crns: list[str]):
-    """After a full crawl, flag sections that no longer appear."""
+    """Flag sections of ``term`` whose CRN is not in ``keep_crns``.
+
+    Called only after a full crawl in which every subject page succeeded.
+    Rows stay in the table; ``is_active`` becomes false so a section that
+    left the schedule is distinguishable from one that is still offered.
+    Returns the number of rows updated. Does not commit.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE sections SET is_active = FALSE "
