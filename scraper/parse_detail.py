@@ -68,9 +68,10 @@ def _fields(soup):
     """Map every bold label on the page to its value string.
 
     Most facts are ``<div><b>Label: </b>value</div>``: the value is the
-    parent's text with the label stripped off. Restrictions and the plural
-    Instructors block put their value in the next sibling ``div``, and
-    that sibling's lines are joined with ``"; "``.
+    parent's text with the label stripped off. Restrictions puts its value
+    in the next sibling ``div``, with its lines joined by ``"; "``. The
+    plural Instructors block spreads one person per sibling ``div``, so
+    every sibling up to the next labeled field is joined with ``"; "``.
     """
     out = {}
     for b in soup.find_all("b"):
@@ -78,9 +79,14 @@ def _fields(soup):
         if not label:
             continue
         parent = b.parent
-        if label in ("Restrictions", "Instructors"):
+        if label == "Restrictions":
             sib = parent.find_next_sibling("div")
             out[label] = "; ".join(sib.stripped_strings) if sib else None
+            continue
+        if label == "Instructors":
+            names = [s for sib in _sibling_divs_until_next_field(parent)
+                     for s in sib.stripped_strings]
+            out[label] = "; ".join(names) or None
             continue
         text = parent.get_text(" ", strip=True)
         prefix = b.get_text(" ", strip=True)
@@ -135,27 +141,77 @@ def _parse_meetings(text, default_start, default_end, warns):
     return meetings
 
 
+def _sibling_divs_until_next_field(div):
+    """Yield the ``div`` siblings after ``div`` up to the next labeled field.
+
+    A multi-value block (several instructors) is a label ``div`` followed by
+    one ``div`` per value. The next field starts at the first sibling that
+    holds a ``<b>`` label (for example ``Meeting:``), so that is where the
+    walk stops.
+    """
+    for sib in div.find_next_siblings("div"):
+        if sib.find("b"):
+            return
+        yield sib
+
+
 def _instructors(soup):
     """Return ``{"key", "netid", "name"}`` for each instructor on the page.
 
+    Rice uses two layouts, and both are handled:
+
+    * One instructor: ``<div><b>Instructor: </b><a ...>Name</a></div>``.
+      The link sits in the same ``div`` as the label.
+    * Several instructors: an empty ``<div><b>Instructors: </b></div>``
+      followed by one ``<div><a ...>Name</a></div>`` per person.
+
     A linked name carries ``p_netid`` in the href, and that netid is the
-    key. A label with no link, such as plain-text ``Staff``, is stored
-    with ``netid`` None and key ``name:<text>``. Both the singular
-    Instructor label and the plural Instructors label are accepted.
+    key. An entry with no link, such as plain-text ``Staff``, is stored with
+    ``netid`` None and key ``name:<text>``. Each person becomes its own dict,
+    and a person who appears twice is returned once. Empty text never
+    produces an instructor.
     """
-    out = []
+    out, seen = [], set()
+
+    def add(key, netid, name):
+        # De-duplicate by key so one person never gets two link rows.
+        if key not in seen:
+            seen.add(key)
+            out.append({"key": key, "netid": netid, "name": name})
+
+    def collect(div, label=""):
+        """Add every instructor found in ``div``; return how many were found."""
+        found = 0
+        links = div.find_all("a", href=True)
+        for a in links:
+            qs = parse_qs(urlparse(a["href"]).query)
+            netid = (qs.get("p_netid") or [None])[0]
+            name = a.get_text(strip=True)
+            if name:
+                add(netid or f"name:{name}", netid, name)
+                found += 1
+        if not links:   # e.g. plain-text "Staff"
+            txt = div.get_text(" ", strip=True)
+            # Drop the label by its real length, not a hardcoded one, so the
+            # plural "Instructors:" does not leave a stray ":" behind.
+            if label and txt.startswith(label):
+                txt = txt[len(label):]
+            txt = txt.strip()
+            if txt:
+                add(f"name:{txt}", None, txt)
+                found += 1
+        return found
+
     for b in soup.find_all("b"):
-        if b.get_text(strip=True).startswith("Instructor"):
-            for a in b.parent.find_all("a", href=True):
-                qs = parse_qs(urlparse(a["href"]).query)
-                netid = (qs.get("p_netid") or [None])[0]
-                name = a.get_text(strip=True)
-                out.append({"key": netid or f"name:{name}",
-                            "netid": netid, "name": name})
-            if not out:   # e.g. plain-text "Staff"
-                txt = b.parent.get_text(" ", strip=True)[len("Instructor:"):].strip()
-                if txt:
-                    out.append({"key": f"name:{txt}", "netid": None, "name": txt})
+        label = b.get_text(" ", strip=True)
+        if not label.startswith("Instructor"):
+            continue
+        parent = b.parent
+        found = collect(parent, label)
+        # The plural layout keeps the people in the sibling divs that follow.
+        if found == 0 or label.startswith("Instructors"):
+            for sib in _sibling_divs_until_next_field(parent):
+                collect(sib)
     return out
 
 
