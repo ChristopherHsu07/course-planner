@@ -8,15 +8,30 @@ that a finished full crawl no longer saw.
 The caller owns transactions: these functions execute and return, and do
 not commit. ``embedding`` is intentionally absent from the section write,
 so a later re-upsert leaves any stored vector in place.
+
+Sections whose ``course_type`` is in ``COLLAPSE_TYPES`` (Research) are
+grouped: each still gets its own row, but ``sections.group_id`` points at one
+shared ``course_groups`` row per subject, course number and title. Browsing
+reads the ``catalog_entries`` view, which shows a group as a single entry,
+while a CRN still resolves to its full row in ``sections``.
 """
 
 import os
 
 import psycopg
+from psycopg.types.json import Jsonb
+
+# Course types that are placeholder numbers rather than real classes: dozens
+# of sections, one advisor slot each, no meetings. They are collapsed into a
+# course_groups row. Independent Study, Studio and Internship/Practicum show
+# the same pattern; add them here to group them too.
+COLLAPSE_TYPES = {"Research"}
 
 # Columns copied from a parse_detail() dict into the sections table.
 # term_code and crn are the primary key and are not overwritten on conflict.
 # scraped_at and is_active are set in the SQL, not taken from the dict.
+# group_id is not in the parsed dict; upsert_section computes it. It is listed
+# here so a section that stops being a research course gets it reset to NULL.
 SECTION_COLS = [
     "term_code", "crn", "subject_code", "course_number", "section_no",
     "title", "long_title", "description", "department", "part_of_term",
@@ -26,6 +41,7 @@ SECTION_COLS = [
     "waitlisted", "waitlist_max", "enrollment_as_of", "final_exam",
     "meeting_raw", "analyzing_diversity",
     "crosslist_max_enrollment", "crosslist_enrolled",
+    "course_url", "prerequisites", "prerequisites_expr", "group_id",
 ]
 
 
@@ -66,11 +82,34 @@ def upsert_section(cur, d: dict):
     the link row is inserted only if that section does not already point
     at that instructor.
 
+    A section whose ``course_type`` is in ``COLLAPSE_TYPES`` is attached to a
+    ``course_groups`` row (created on first sight, matched on subject, course
+    number and title); any other section has ``group_id`` NULL. The section
+    row itself is always written in full. ``prerequisites_expr`` is a Python
+    structure and is wrapped as JSONB here.
+
     Uses the cursor it is given and does not commit or roll back.
     """
     d = dict(d)
     # Collapse whitespace, including non-breaking spaces, to single spaces.
     d["meeting_raw"] = " ".join((d["meeting_raw"] or "").split())
+    # psycopg does not turn a dict into JSONB by itself.
+    expr = d.get("prerequisites_expr")
+    d["prerequisites_expr"] = Jsonb(expr) if expr is not None else None
+
+    d["group_id"] = None
+    if d["course_type"] in COLLAPSE_TYPES:
+        # The no-op DO UPDATE makes RETURNING hand back the id of an existing
+        # row too; DO NOTHING would return nothing on a repeat.
+        cur.execute(
+            "INSERT INTO course_groups (subject_code, course_number, title, "
+            "course_type) VALUES (%s,%s,%s,%s) "
+            "ON CONFLICT (subject_code, course_number, title) "
+            "DO UPDATE SET course_type = EXCLUDED.course_type RETURNING id",
+            (d["subject_code"], d["course_number"], d["title"] or "",
+             d["course_type"]),
+        )
+        d["group_id"] = cur.fetchone()[0]
 
     cols = ", ".join(SECTION_COLS)
     vals = ", ".join(f"%({c})s" for c in SECTION_COLS)

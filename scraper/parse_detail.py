@@ -4,7 +4,9 @@ A detail page is the response to ``p_action=COURSE`` for one CRN. The
 heading looks like ``ASIA 104 001 (CRN: 26861)``. Labeled facts sit in
 ``<b>Label:</b> value`` blocks. Meetings are free text such as
 ``4:00PM - 5:15PM MW (11-JAN-2027 - 23-APR-2027)`` and are expanded into
-one row per weekday. Anything the parser does not understand is collected
+one row per weekday. Prerequisites such as ``(MATH 102 OR MATH 106) AND
+COMP 182`` are kept as text and also parsed into nested AND/OR JSON.
+Anything the parser does not understand is collected
 in ``warnings`` and still returned; only a missing section heading raises.
 """
 
@@ -40,8 +42,17 @@ KNOWN_LABELS = {
     "Section Max Enrollment", "Section Enrolled", "Waitlisted",
     "Enrollment data as of", "Additional Fees", "Final Exam", "Description",
     "Analyzing Diversity", "Total Cross-list Max Enrollment",
-    "Total Cross-list Enrolled", "Instructors",
+    "Total Cross-list Enrolled", "Instructors", "Meetings",
+    "Course URL", "Prerequisites",
 }
+
+# One token of a prerequisite expression, in order of preference:
+# "(", ")", AND / OR, or a course such as "COMP 182" (optionally "COMP 101A").
+# \b after AND/OR keeps a subject code that merely starts with those letters
+# (an "ORGS 101") from being read as an operator.
+PREREQ_TOKEN_RE = re.compile(
+    r"\s*(?:(?P<open>\()|(?P<close>\))|(?P<op>AND|OR)\b"
+    r"|(?P<course>[A-Z]{2,5}\s+\d{3}[A-Z]?))")
 
 
 def _date(s):
@@ -101,11 +112,25 @@ def _meeting_text(soup):
     Line breaks matter: each schedule line is parsed separately, and a
     section can have more than one (a lecture and a lab, or a date range
     that changes mid-term). Returns ``""`` when the page has no Meeting label.
+
+    Rice uses two layouts, and both are handled:
+
+    * ``<div><b>Meeting: </b>2:30PM - 3:45PM TR (...)</div>``: the text sits
+      in the same ``div`` as the label.
+    * ``<div><b>Meetings: </b></div>`` followed by one ``div`` per schedule
+      line. The label ``div`` is empty, so the lines are read from the
+      sibling ``div``s up to the next labeled field.
     """
     for b in soup.find_all("b"):
         label = b.get_text(strip=True)
         if label.startswith("Meeting"):
-            return b.parent.get_text("\n", strip=True).replace(label, "", 1).strip()
+            text = b.parent.get_text("\n", strip=True).replace(label, "", 1).strip()
+            # The plural layout (or an empty label) keeps its lines in siblings.
+            if not text or label.startswith("Meetings"):
+                lines = [text] + [sib.get_text("\n", strip=True) for sib in
+                                  _sibling_divs_until_next_field(b.parent)]
+                text = "\n".join(line for line in lines if line)
+            return text
     return ""
 
 
@@ -215,6 +240,101 @@ def _instructors(soup):
     return out
 
 
+def _course_url(soup):
+    """Return the link target of the ``Course URL`` field, or None.
+
+    The page renders ``<b>Course URL: </b><a href="...">...</a>``. The href is
+    used rather than the visible text so a shortened label cannot change the
+    stored address.
+    """
+    for b in soup.find_all("b"):
+        if b.get_text(" ", strip=True).rstrip(":").strip() == "Course URL":
+            a = b.parent.find("a", href=True)
+            if a and a["href"].strip():
+                return a["href"].strip()
+    return None
+
+
+def _prereq_tokens(text):
+    """Split a prerequisite string into ``(kind, value)`` tokens.
+
+    Kinds are ``open``, ``close``, ``op`` (``AND`` or ``OR``) and ``course``
+    (normalized to ``"SUBJ 123"``). Raises ``ValueError`` on any character the
+    grammar does not cover, so unfamiliar wording is reported, not guessed at.
+    """
+    tokens, pos = [], 0
+    text = text.strip()
+    while pos < len(text):
+        m = PREREQ_TOKEN_RE.match(text, pos)
+        if not m:
+            raise ValueError(f"unexpected text at {text[pos:pos + 20]!r}")
+        kind = m.lastgroup
+        value = " ".join(m.group(kind).split())
+        tokens.append((kind, value))
+        pos = m.end()
+        # Skip trailing whitespace so the end-of-string check above is exact.
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+    return tokens
+
+
+def _parse_prerequisites(text):
+    """Parse a prerequisite string into a nested AND/OR structure.
+
+    ``"(MATH 102 OR MATH 106) AND COMP 182"`` becomes::
+
+        {"and": [{"or": ["MATH 102", "MATH 106"]}, "COMP 182"]}
+
+    Leaves are course strings; groups are ``{"and": [...]}`` or
+    ``{"or": [...]}``. A lone course is wrapped as ``{"and": ["COMP 140"]}``
+    so the root is always an object. Within one level every operator must be
+    the same: a level that mixes AND and OR without parentheses has no defined
+    precedence, so it is rejected instead of silently picking one.
+
+    Raises ``ValueError`` for anything that does not parse (unknown wording,
+    unbalanced parentheses, mixed operators). Callers keep the raw text then.
+    """
+    tokens = _prereq_tokens(text)
+    if not tokens:
+        raise ValueError("empty prerequisite")
+    pos = 0
+
+    def peek():
+        return tokens[pos] if pos < len(tokens) else (None, None)
+
+    def operand():
+        nonlocal pos
+        kind, value = peek()
+        if kind == "course":
+            pos += 1
+            return value
+        if kind == "open":
+            pos += 1
+            node = group()
+            if peek()[0] != "close":
+                raise ValueError("missing closing parenthesis")
+            pos += 1
+            return node
+        raise ValueError(f"expected a course or '(' but found {value!r}")
+
+    def group():
+        nonlocal pos
+        items, op = [operand()], None
+        while peek()[0] == "op":
+            this = tokens[pos][1].lower()
+            if op is not None and this != op:
+                raise ValueError("AND and OR mixed without parentheses")
+            op = this
+            pos += 1
+            items.append(operand())
+        return items[0] if op is None else {op: items}
+
+    root = group()
+    if pos != len(tokens):
+        raise ValueError(f"unexpected {tokens[pos][1]!r} after expression")
+    return {"and": [root]} if isinstance(root, str) else root
+
+
 def parse_detail(html: str) -> dict:
     """Parse a section detail page into the dict ``upsert_section`` expects.
 
@@ -230,9 +350,15 @@ def parse_detail(html: str) -> dict:
     Diversity is true when its value starts with ``y``. Cross-list counts
     are None when those labels are absent.
 
+    ``course_url`` is the link target of the Course URL field.
+    ``prerequisites`` is the raw text with whitespace collapsed, and
+    ``prerequisites_expr`` is the same expression as nested AND/OR JSON (see
+    ``_parse_prerequisites``); it is None when there are no prerequisites or
+    the text does not parse, in which case the raw text still survives.
+
     ``warnings`` lists unknown labels, unparsed meeting lines, unknown day
-    letters, and an instructor label that yielded no name. The caller logs
-    them; they do not fail the parse.
+    letters, an instructor label that yielded no name, and prerequisites that
+    did not parse. The caller logs them; they do not fail the parse.
     """
     soup = BeautifulSoup(html, "lxml")
     root = soup.find(id="rice-upflow-data")
@@ -263,6 +389,15 @@ def parse_detail(html: str) -> dict:
     if ("Instructor" in f or "Instructors" in f) and not instructors:
         warns.append("instructor label present but no names parsed")
     ad = f.get("Analyzing Diversity")
+
+    # Raw prerequisite text is always kept; the structured form is best-effort.
+    prereq_raw = " ".join((f.get("Prerequisites") or "").split()) or None
+    prereq_expr = None
+    if prereq_raw:
+        try:
+            prereq_expr = _parse_prerequisites(prereq_raw)
+        except ValueError as e:
+            warns.append(f"unparsed prerequisites: {prereq_raw!r} ({e})")
 
     return {
         "term_code": soup.body.get("term") if soup.body else None,
@@ -299,4 +434,7 @@ def parse_detail(html: str) -> dict:
         "analyzing_diversity": bool(ad and ad.strip().lower().startswith("y")),
         "crosslist_max_enrollment": _int(f.get("Total Cross-list Max Enrollment")),
         "crosslist_enrolled": _int(f.get("Total Cross-list Enrolled")),
+        "course_url": _course_url(soup) or f.get("Course URL"),
+        "prerequisites": prereq_raw,
+        "prerequisites_expr": prereq_expr,
     }
