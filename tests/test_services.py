@@ -361,7 +361,7 @@ def test_search_finds_a_section_by_title_keyword(conn, meeting):
     words = [w for w in re.findall(r"[A-Za-z]{5,}", title or "")]
     if not words:
         pytest.skip("sample title has no long word")
-    got = search_sections(conn, words[0], limit=200)
+    got = search_sections(conn, words[0], mode="keyword", limit=200)
     assert meeting["crn"] in crns(got)
     scores = [s.score for s in got]
     assert scores == sorted(scores, reverse=True)
@@ -374,7 +374,8 @@ def test_search_description_words_and_no_results(conn):
 def test_search_is_safe_with_special_characters(conn):
     for text in ("100%", "a_b", "O'Brien; DROP TABLE sections", "\\", "()",
                  "c++ & friends"):
-        search_sections(conn, text)   # must not raise
+        for mode in ("keyword", "auto"):
+            search_sections(conn, text, mode=mode)   # must not raise
     assert q(conn, "SELECT count(*) AS n FROM sections")[0]["n"] > 0
 
 

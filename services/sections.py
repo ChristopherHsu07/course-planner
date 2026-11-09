@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .db import cursor, resolve_term
 from .models import (DAY_LETTERS, Instructor, Meeting, SeatStatus,
@@ -133,21 +133,26 @@ def _open_seats(max_enrollment: Optional[int],
 def query_summaries(conn, clauses: Sequence[str], params: dict[str, Any], *,
                     order_by: str, limit: int,
                     score_sql: str = "NULL::float8",
-                    extra_params: Optional[dict[str, Any]] = None
+                    extra_params: Optional[dict[str, Any]] = None,
+                    ctes: str = "", joins: str = ""
                     ) -> list[SectionSummary]:
     """Run a section query and build ``SectionSummary`` rows.
 
     ``clauses`` are ANDed into WHERE (they may reference ``s``); ``score_sql``
     is an expression selected as ``score``; ``order_by`` must be trusted SQL
-    (it is never built from user text). Instructors and meetings are loaded
-    for the returned rows only.
+    (it is never built from user text). ``ctes`` (a full ``WITH ...`` prefix)
+    and ``joins`` (join clauses after ``FROM sections s``) let a caller bring
+    in its own ranking tables. Instructors and meetings are loaded for the
+    returned rows only.
     """
     sql = f"""
+        {ctes}
         SELECT s.term_code, s.crn, s.subject_code, s.course_number,
                s.section_no, s.title, s.credits, s.distribution_group,
                s.method, s.course_type, s.max_enrollment, s.enrolled,
                {score_sql} AS score
         FROM sections s
+        {joins}
         WHERE {' AND '.join(clauses)}
         ORDER BY {order_by}
         LIMIT %(limit)s
@@ -210,22 +215,68 @@ def _meeting_tuples(conn, term: str,
 # search_sections
 # --------------------------------------------------------------------------
 
+SEARCH_MODES = ("auto", "keyword", "semantic", "hybrid")
+
+# Cosine similarity (1 = same direction) a course must reach to count as a
+# semantic match. Without a floor, vector search always returns the "nearest"
+# courses, even for nonsense. Tuned on real queries; see tests.
+MIN_SIMILARITY = 0.30
+
+# Reciprocal rank fusion constant: a result at rank r gets 1 / (RRF_K + r)
+# from each ranking it appears in. 60 is the usual default; it only controls
+# how quickly the credit falls off down the list.
+RRF_K = 60
+
+
+def _has_embeddings(conn, model_name: str) -> bool:
+    """True if ``course_embeddings`` exists and has vectors from ``model_name``."""
+    with cursor(conn) as cur:
+        cur.execute("SELECT to_regclass('course_embeddings') IS NOT NULL AS ok")
+        if not cur.fetchone()["ok"]:
+            return False
+        cur.execute("SELECT EXISTS (SELECT 1 FROM course_embeddings "
+                    "WHERE model = %s) AS ok", (model_name,))
+        return cur.fetchone()["ok"]
+
+
 def search_sections(conn, query: Optional[str] = None,
                     filters: Optional[SectionFilters] = None,
-                    limit: int = 20) -> list[SectionSummary]:
-    """Keyword search over sections, narrowed by ``filters``.
+                    limit: int = 20, *, mode: str = "auto",
+                    embed_fn: Optional[Callable[[Sequence[str]],
+                                                list[list[float]]]] = None,
+                    model_name: Optional[str] = None,
+                    min_similarity: Optional[float] = None
+                    ) -> list[SectionSummary]:
+    """Search sections by keywords and/or meaning, narrowed by ``filters``.
 
     ``query`` may be free text ("machine learning"), a course code ("COMP
-    140", "comp140"), or empty to list sections by the filters alone. Free
-    text matches on any word (stemmed) in the title, long title or
-    description, with title matches weighted highest, plus a literal
-    substring match on the titles. An exact course code ranks first. Results
-    are ordered by ``score`` (higher is better) and are individual sections;
+    140", "comp140"), or empty to list sections by the filters alone. Results
+    are individual sections ordered by ``score`` (higher is better);
     collapsed Research placeholders are hidden unless
-    ``filters.include_grouped``.
+    ``filters.include_grouped``. An exact course code always ranks first.
 
-    Semantic (embedding) search is not part of this yet.
+    ``mode`` chooses the matching:
+
+    * ``"keyword"``: any query word (stemmed) in the title, long title or
+      description, title matches weighted highest, plus a literal substring
+      match on the titles.
+    * ``"semantic"``: courses whose embedding is at least ``min_similarity``
+      (default ``MIN_SIMILARITY``) close to the query's. ``score`` is that
+      cosine similarity.
+    * ``"hybrid"``: both, combined by reciprocal rank fusion
+      (``score = 1/(60+keyword rank) + 1/(60+semantic rank)``).
+    * ``"auto"`` (default): hybrid when ``course_embeddings`` has vectors,
+      otherwise keyword. Course-code queries and empty queries never need
+      embeddings, so they stay keyword.
+
+    ``filters`` apply before ranking, so they cannot starve either list.
+    ``embed_fn`` / ``model_name`` replace the default embedding model (the
+    vectors in ``course_embeddings`` must come from the same model). Asking
+    for ``"semantic"`` or ``"hybrid"`` explicitly when no vectors exist
+    raises ``RuntimeError`` rather than quietly returning keyword results.
     """
+    if mode not in SEARCH_MODES:
+        raise ValueError(f"mode must be one of {SEARCH_MODES}, got {mode!r}")
     term = resolve_term(conn, filters.term_code if filters else None)
     if term is None:
         return []
@@ -237,11 +288,83 @@ def search_sections(conn, query: Optional[str] = None,
             conn, clauses, params, limit=limit,
             order_by="s.subject_code, s.course_number, s.section_no")
 
+    from . import embeddings   # lazy: keeps `python -m services.embeddings` clean
+    model = model_name or embeddings.MODEL_NAME
+    use_semantic = False
+    if mode != "keyword":
+        have = _has_embeddings(conn, model)
+        if mode == "auto":
+            use_semantic = have and not _CODE_RE.match(q)
+        elif not have:
+            raise RuntimeError(
+                "no course embeddings for this model; run "
+                "`python -m services.embeddings` first")
+        else:
+            use_semantic = True
+
+    match_sql, score_sql, extra, is_code = _keyword_relevance(q)
+    if not use_semantic:
+        clauses.append(f"({match_sql})")
+        return query_summaries(
+            conn, clauses, params, limit=limit, extra_params=extra,
+            score_sql=score_sql,
+            order_by="score DESC, s.subject_code, s.course_number, s.section_no")
+
+    # Semantic or hybrid. Two ranking CTEs run over the same filtered
+    # sections; the outer query keeps sections found by either and scores them.
+    use_keyword = mode != "semantic"
+    qvec = (embed_fn or embeddings.embed_texts)([q])[0]
+    extra.update(
+        qvec=embeddings.vector_literal(qvec), model=model,
+        min_sim=MIN_SIMILARITY if min_similarity is None else min_similarity)
+    filt = " AND ".join(clauses)
+    if use_keyword:
+        kw_cte = (f"SELECT s.crn, row_number() OVER (ORDER BY {score_sql} DESC, "
+                  f"s.subject_code, s.course_number, s.crn) AS r "
+                  f"FROM sections s WHERE {filt} AND ({match_sql})")
+    else:
+        kw_cte = "SELECT NULL::text AS crn, NULL::bigint AS r WHERE FALSE"
+    # Sections of one course share a vector, so they tie and share a rank.
+    sem_cte = f"""
+        SELECT x.crn, x.sim, dense_rank() OVER (ORDER BY x.sim DESC) AS r
+        FROM (SELECT s.crn, 1 - (e.embedding <=> %(qvec)s::vector) AS sim
+              FROM sections s
+              JOIN course_embeddings e
+                ON e.subject_code = s.subject_code
+               AND e.course_number = s.course_number
+               AND e.title = COALESCE(s.title, '')
+               AND e.model = %(model)s
+              WHERE {filt}) x
+        WHERE x.sim >= %(min_sim)s"""
+    if use_keyword:
+        boost = f"(CASE WHEN {is_code} THEN 1 ELSE 0 END)" if is_code else "0"
+        final = (f"(COALESCE(1.0 / ({RRF_K} + kw.r), 0) "
+                 f"+ COALESCE(1.0 / ({RRF_K} + sem.r), 0) + {boost})::float8")
+    else:
+        final = "COALESCE(sem.sim, 0)::float8"
+    clauses.append("(kw.crn IS NOT NULL OR sem.crn IS NOT NULL)")
+    return query_summaries(
+        conn, clauses, params, limit=limit, extra_params=extra,
+        ctes=f"WITH kw AS ({kw_cte}), sem AS ({sem_cte})",
+        joins="LEFT JOIN kw ON kw.crn = s.crn LEFT JOIN sem ON sem.crn = s.crn",
+        score_sql=final,
+        order_by="score DESC, s.subject_code, s.course_number, s.section_no")
+
+
+def _keyword_relevance(q: str) -> tuple[str, str, dict[str, Any], Optional[str]]:
+    """SQL pieces for keyword matching ``q`` against ``sections s``.
+
+    Returns ``(match_sql, score_sql, params, is_code_sql)``: a condition that
+    is true if any keyword rule matches, a numeric relevance expression, the
+    named parameters both use, and (when ``q`` is a course code) the
+    condition for an exact code match, else ``None``.
+    """
     # Pieces of the relevance expression. Each is added to the score and any
     # one of them matching lets the section into the results.
     extra: dict[str, Any] = {"q_like": f"%{_like(q)}%"}
     match_parts: list[str] = []
     score_parts: list[str] = []
+    is_code: Optional[str] = None
 
     code = _CODE_RE.match(q)
     if code:
@@ -269,11 +392,8 @@ def search_sections(conn, query: Optional[str] = None,
     match_parts.append(title_like)
     score_parts.append(f"(CASE WHEN {title_like} THEN 1 ELSE 0 END)")
 
-    clauses.append("(" + " OR ".join(match_parts) + ")")
-    return query_summaries(
-        conn, clauses, params, limit=limit, extra_params=extra,
-        score_sql="(" + " + ".join(score_parts) + ")::float8",
-        order_by="score DESC, s.subject_code, s.course_number, s.section_no")
+    return (" OR ".join(match_parts),
+            "(" + " + ".join(score_parts) + ")::float8", extra, is_code)
 
 
 # --------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 DROP TABLE IF EXISTS meetings, section_instructors, instructors,
-                     sections, course_groups, courses, subjects CASCADE;
+                     sections, course_groups, course_embeddings, courses,
+                     subjects CASCADE;
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE subjects (
@@ -121,3 +122,20 @@ JOIN course_groups g ON g.id = s.group_id
 WHERE s.is_active
 GROUP BY s.term_code, g.id, g.subject_code, g.course_number, g.title,
          g.course_type;
+
+-- One embedding per distinct course (subject + number + title, the same key
+-- as course_groups), not per section: sections of a course share their text,
+-- and the vectors stay valid across terms and re-crawls. Written by
+-- `python -m services.embeddings`. `model` and `content_hash` (sha256 of the
+-- embedded text) let a refresh skip rows that are already up to date.
+-- sections.embedding (above) is unused.
+CREATE TABLE IF NOT EXISTS course_embeddings (
+  subject_code  TEXT NOT NULL,
+  course_number TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  embedding     vector(384) NOT NULL,
+  model         TEXT NOT NULL,
+  content_hash  TEXT NOT NULL,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (subject_code, course_number, title)
+);
