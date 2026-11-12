@@ -14,9 +14,11 @@ import re
 from collections import defaultdict
 from typing import Any, Callable, Iterable, Optional, Sequence
 
+from .busy import busy_clause, coerce_blocks
 from .db import cursor, resolve_term
-from .models import (DAY_LETTERS, Instructor, Meeting, SeatStatus,
-                     SectionDetail, SectionFilters, SectionSummary, hhmm)
+from .models import (DAY_LETTERS, DAY_NUM, BusyBlock, Instructor, Meeting,
+                     SeatStatus, SectionDetail, SectionFilters,
+                     SectionSummary, hhmm, parse_hhmm)
 
 MAX_LIMIT = 200
 
@@ -104,7 +106,44 @@ def build_filter_clauses(filters: Optional[SectionFilters],
         params["credits_max"] = f.credits_max
         clauses.append(f"{_CREDITS_MIN} <= %(credits_max)s")
 
+    # Wanted meeting pattern: every meeting must fit, and there must be at
+    # least one (a section with no meetings cannot be shown to fit).
+    days = _parse_days(f.days)
+    start_after = parse_hhmm(f.start_after) if f.start_after else None
+    end_before = parse_hhmm(f.end_before) if f.end_before else None
+    if days or start_after or end_before:
+        clauses.append("EXISTS (SELECT 1 FROM meetings w "
+                       "WHERE w.term_code = s.term_code AND w.crn = s.crn)")
+        misfits = []
+        if days:
+            params["want_days"] = [DAY_NUM[d] for d in days]
+            misfits.append("w.day_of_week <> ALL(%(want_days)s::smallint[])")
+        if start_after:
+            params["want_after"] = start_after
+            misfits.append("w.start_time < %(want_after)s")
+        if end_before:
+            params["want_before"] = end_before
+            misfits.append("w.end_time > %(want_before)s")
+        clauses.append(
+            "NOT EXISTS (SELECT 1 FROM meetings w "
+            "WHERE w.term_code = s.term_code AND w.crn = s.crn "
+            f"AND ({' OR '.join(misfits)}))")
+
     return clauses, params
+
+
+def _parse_days(days: Optional[str | Sequence[str]]) -> list[str]:
+    """Distinct Rice day letters from ``"MWF"``, ``"M W F"`` or a list."""
+    if not days:
+        return []
+    text = days if isinstance(days, str) else "".join(str(d) for d in days)
+    letters = [c for c in text.upper() if c not in " ,/"]
+    bad = [c for c in letters if c not in DAY_NUM]
+    if bad:
+        raise ValueError(
+            f"days must use the letters {' '.join(DAY_NUM)} (R = Thursday), "
+            f"got {days!r}")
+    return list(dict.fromkeys(letters))
 
 
 def format_meeting_summary(meetings: Iterable[tuple[int, str, str]]) -> str:
@@ -150,6 +189,10 @@ def query_summaries(conn, clauses: Sequence[str], params: dict[str, Any], *,
         SELECT s.term_code, s.crn, s.subject_code, s.course_number,
                s.section_no, s.title, s.credits, s.distribution_group,
                s.method, s.course_type, s.max_enrollment, s.enrolled,
+               s.permission_required, s.restrictions, s.enrollment_as_of,
+               EXISTS (SELECT 1 FROM meetings mm
+                       WHERE mm.term_code = s.term_code
+                         AND mm.crn = s.crn) AS has_meetings,
                {score_sql} AS score
         FROM sections s
         {joins}
@@ -177,8 +220,12 @@ def query_summaries(conn, clauses: Sequence[str], params: dict[str, Any], *,
             method=r["method"], course_type=r["course_type"],
             instructors=names.get(r["crn"], []),
             meeting_summary=format_meeting_summary(meetings.get(r["crn"], [])),
+            has_meetings=r["has_meetings"],
             max_enrollment=r["max_enrollment"], enrolled=r["enrolled"],
             open_seats=_open_seats(r["max_enrollment"], r["enrolled"]),
+            permission_required=r["permission_required"],
+            restrictions=r["restrictions"],
+            enrollment_as_of=r["enrollment_as_of"],
             score=float(r["score"]) if r["score"] is not None else None,
         )
         for r in rows
@@ -245,7 +292,8 @@ def search_sections(conn, query: Optional[str] = None,
                     embed_fn: Optional[Callable[[Sequence[str]],
                                                 list[list[float]]]] = None,
                     model_name: Optional[str] = None,
-                    min_similarity: Optional[float] = None
+                    min_similarity: Optional[float] = None,
+                    busy_blocks: Optional[Sequence[BusyBlock | dict]] = None
                     ) -> list[SectionSummary]:
     """Search sections by keywords and/or meaning, narrowed by ``filters``.
 
@@ -270,6 +318,9 @@ def search_sections(conn, query: Optional[str] = None,
       embeddings, so they stay keyword.
 
     ``filters`` apply before ranking, so they cannot starve either list.
+    ``busy_blocks`` (``BusyBlock`` objects or tool-format dicts) drops every
+    section with a meeting that overlaps one, in any mode and with or
+    without a query; a bad block raises ``ValueError``.
     ``embed_fn`` / ``model_name`` replace the default embedding model (the
     vectors in ``course_embeddings`` must come from the same model). Asking
     for ``"semantic"`` or ``"hybrid"`` explicitly when no vectors exist
@@ -281,6 +332,9 @@ def search_sections(conn, query: Optional[str] = None,
     if term is None:
         return []
     clauses, params = build_filter_clauses(filters, term)
+    blocks = coerce_blocks(busy_blocks or [])
+    if blocks:
+        clauses.append(busy_clause(blocks, params))
 
     q = (query or "").strip()
     if not q:

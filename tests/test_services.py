@@ -449,6 +449,78 @@ def test_filter_credit_range(conn):
     assert none == []
 
 
+def _meetings_by_crn(conn, term, found):
+    rows = q(conn, "SELECT crn, day_of_week, start_time, end_time FROM meetings "
+                   "WHERE term_code = %s AND crn = ANY(%s)",
+             (term, [s.crn for s in found]))
+    out = {}
+    for r in rows:
+        out.setdefault(r["crn"], []).append(r)
+    return out
+
+
+def test_filter_meeting_days(conn, term):
+    got = search_sections(conn, None, SectionFilters(days="MWF"), limit=200)
+    assert got
+    meetings = _meetings_by_crn(conn, term, got)
+    for s in got:
+        rows = meetings.get(s.crn)
+        assert rows, f"{s.crn} has no meetings but matched a days filter"
+        assert {r["day_of_week"] for r in rows} <= {1, 3, 5}
+    # Same set however the days are written.
+    spaced = search_sections(conn, None, SectionFilters(days=["m", "W", "f"]),
+                             limit=200)
+    assert crns(spaced) == crns(got)
+    assert crns(search_sections(conn, None, SectionFilters(days="M W, F"),
+                                limit=200)) == crns(got)
+
+
+def test_filter_morning_window(conn, term):
+    got = search_sections(conn, None, SectionFilters(end_before="12:00"),
+                          limit=200)
+    assert got
+    for rows in _meetings_by_crn(conn, term, got).values():
+        assert all(r["end_time"] <= time(12, 0) for r in rows)
+    afternoon = search_sections(conn, None, SectionFilters(
+        start_after="13:00"), limit=200)
+    assert afternoon
+    for rows in _meetings_by_crn(conn, term, afternoon).values():
+        assert all(r["start_time"] >= time(13, 0) for r in rows)
+    assert not set(crns(got)) & set(crns(afternoon))
+
+
+def test_meeting_time_filters_drop_sections_without_meetings(conn, term):
+    no_meeting = {r["crn"] for r in q(conn, """
+        SELECT crn FROM sections s WHERE term_code = %s AND is_active
+          AND group_id IS NULL AND NOT EXISTS (
+            SELECT 1 FROM meetings m WHERE m.term_code = s.term_code
+              AND m.crn = s.crn)""", (term,))}
+    everything = search_sections(conn, None, limit=200)
+    got = search_sections(conn, None, SectionFilters(
+        days="MTWRFSU", start_after="00:00", end_before="23:59"), limit=200)
+    assert not set(crns(got)) & no_meeting
+    if no_meeting and len(everything) < 200:
+        assert no_meeting & set(crns(everything))
+
+
+def test_meeting_filters_combine_with_busy_blocks(conn, term):
+    block = BusyBlock("M", "08:00", "23:00")
+    got = search_sections(conn, None, SectionFilters(days="MWF"), limit=200,
+                          busy_blocks=[block])
+    plain = search_sections(conn, None, SectionFilters(days="MWF"), limit=200)
+    assert got and set(crns(got)) < set(crns(plain))     # some were dropped
+    for rows in _meetings_by_crn(conn, term, got).values():
+        assert {r["day_of_week"] for r in rows} <= {1, 3, 5}
+        assert not any(r["day_of_week"] == 1 for r in rows)  # no Monday at all
+
+
+def test_bad_day_letters_raise(conn):
+    with pytest.raises(ValueError, match="days must use"):
+        search_sections(conn, None, SectionFilters(days="MXF"))
+    with pytest.raises(ValueError):
+        search_sections(conn, None, SectionFilters(end_before="noon"))
+
+
 def test_filter_instructor_by_name_and_netid(conn, term):
     row = q(conn, """
         SELECT i.netid, i.name, si.crn FROM section_instructors si
@@ -607,3 +679,85 @@ def test_results_serialize_to_json(conn, meeting):
     json.dumps([s.to_dict() for s in list_subjects(conn)])
     assert d.to_dict()["meetings"][0]["start_time"] == hhmm(
         meeting["start_time"]) or len(d.meetings) > 1
+
+
+# --------------------------------------------------------------------------
+# busy_blocks on search_sections, summary fields, freshness
+# --------------------------------------------------------------------------
+
+def test_search_with_busy_blocks_matches_find_sections_avoiding(conn):
+    blocks = [BusyBlock("M", "09:00", "10:30"), BusyBlock("R", "13:00", "14:15")]
+    f = SectionFilters(subject="COMP", level_min=100, level_max=299)
+    a = search_sections(conn, None, f, limit=200, busy_blocks=blocks)
+    b = find_sections_avoiding(conn, blocks, f, limit=200)
+    assert [s.crn for s in a] == [s.crn for s in b] and a
+    # Dict (tool-format) blocks work too.
+    c = search_sections(conn, None, f, limit=200, busy_blocks=[
+        {"day": "M", "start": "09:00", "end": "10:30"},
+        {"day": "R", "start": "13:00", "end": "14:15"}])
+    assert [s.crn for s in c] == [s.crn for s in a]
+
+
+def test_search_with_query_and_busy_blocks_in_every_mode(conn, meeting):
+    code = f"{meeting['subject_code']} {meeting['course_number']}"
+    block = block_for(meeting)
+    for text in (code, "calculus", "writing poetry"):
+        for mode in ("keyword", "hybrid"):
+            plain = search_sections(conn, text, mode=mode, limit=200)
+            kept = search_sections(conn, text, mode=mode, limit=200,
+                                   busy_blocks=[block])
+            assert crns(kept) <= crns(plain)
+            assert meeting["crn"] not in crns(kept)
+    assert meeting["crn"] in crns(search_sections(conn, code, limit=200))
+
+
+def test_search_rejects_invalid_busy_block(conn):
+    with pytest.raises(ValueError):
+        search_sections(conn, "calculus", busy_blocks=[
+            {"day": "Q", "start": "10:00", "end": "11:00"}])
+
+
+def test_summary_fields_match_the_table(conn, term):
+    rows = {r["crn"]: r for r in q(conn, """
+        SELECT s.crn, s.permission_required, s.restrictions, s.enrollment_as_of,
+               EXISTS (SELECT 1 FROM meetings m WHERE m.term_code = s.term_code
+                       AND m.crn = s.crn) AS has_meetings
+        FROM sections s WHERE s.term_code = %s""", (term,))}
+    got = search_sections(conn, None, SectionFilters(include_grouped=True),
+                          limit=200)
+    assert got
+    for s in got:
+        r = rows[s.crn]
+        assert s.permission_required == r["permission_required"]
+        assert s.restrictions == r["restrictions"]
+        assert s.enrollment_as_of == r["enrollment_as_of"]
+        assert s.has_meetings == r["has_meetings"]
+        assert s.has_meetings == bool(s.meeting_summary)
+    assert any(not s.has_meetings for s in got)
+    json.dumps([s.to_dict() for s in got])
+
+
+def test_term_label():
+    from services import term_label
+    assert term_label("202720") == "Spring 2027"
+    assert term_label("202710") == "Fall 2026"
+    assert term_label("202730") == "Summer 2027"
+    assert term_label("weird") == "weird"
+    assert term_label(None) is None
+
+
+def test_get_data_freshness_matches_the_table(conn, term):
+    from services import get_data_freshness
+    f = get_data_freshness(conn)
+    row = q(conn, """SELECT count(*) AS n, min(enrollment_as_of) AS lo,
+                            max(enrollment_as_of) AS hi, max(scraped_at) AS ld
+                     FROM sections WHERE is_active AND term_code = %s""",
+            (term,))[0]
+    assert (f.term_code, f.term_label) == (term, "Spring 2027")
+    assert f.active_sections == row["n"]
+    assert (f.enrollment_as_of_min, f.enrollment_as_of_max, f.loaded_at) == (
+        row["lo"], row["hi"], row["ld"])
+    assert f.enrollment_as_of_min <= f.enrollment_as_of_max
+    json.dumps(f.to_dict())
+    empty = get_data_freshness(conn, "000000")
+    assert empty.active_sections == 0 and empty.enrollment_as_of_min is None

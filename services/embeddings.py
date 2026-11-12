@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
@@ -32,20 +33,33 @@ DIM = 384        # must match course_embeddings.embedding vector(384)
 EmbedFn = Callable[[Sequence[str]], list[list[float]]]
 
 _model = None
+_model_lock = threading.Lock()   # a background warm-up and a search may race
 
 
 def get_model():
-    """Load the sentence-transformers model once and reuse it."""
+    """Load the sentence-transformers model once and reuse it.
+
+    Importing ``sentence_transformers`` is slow the first time in a process
+    (it pulls in ``transformers``); the lock makes a concurrent caller wait
+    for that load instead of starting a second one.
+    """
     global _model
     if _model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as e:   # pragma: no cover - environment problem
-            raise ImportError(
-                "semantic search needs sentence-transformers; "
-                "run `pip install -r requirements.txt`") from e
-        _model = SentenceTransformer(MODEL_NAME)
+        with _model_lock:
+            if _model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                except ImportError as e:   # pragma: no cover - environment
+                    raise ImportError(
+                        "semantic search needs sentence-transformers; "
+                        "run `pip install -r requirements.txt`") from e
+                _model = SentenceTransformer(MODEL_NAME)
     return _model
+
+
+def warm_up() -> None:
+    """Load the model and run one query so later searches are instant."""
+    embed_query("warm up")
 
 
 def embed_texts(texts: Sequence[str]) -> list[list[float]]:

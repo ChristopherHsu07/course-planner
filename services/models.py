@@ -137,6 +137,15 @@ class SectionFilters(_Model):
     * ``open_seats_only``: only sections with ``max_enrollment > enrolled``.
     * ``credits_min`` / ``credits_max``: a section matches if any credit
       value it allows lies in the range (``"1 TO 4"`` allows 1 through 4).
+    * ``days``: Rice day letters such as ``"MWF"`` or ``"TR"`` (a string or a
+      list). Keeps sections whose meetings all fall on those days; a section
+      that meets only ``MW`` matches ``"MWF"``. This is what the student
+      *wants*, not what they are busy with (that is ``busy_blocks``).
+    * ``start_after`` / ``end_before``: ``"HH:MM"`` (24-hour). Keeps sections
+      whose meetings all start at or after / end at or before that time,
+      e.g. ``end_before="12:00"`` for morning classes.
+    * Using any of ``days``, ``start_after`` or ``end_before`` also drops
+      sections with no scheduled meeting, since they cannot be checked.
     * ``term_code``: defaults to the latest active term.
     * ``include_grouped``: also return collapsed Research placeholder
       sections (off by default).
@@ -151,6 +160,9 @@ class SectionFilters(_Model):
     open_seats_only: bool = False
     credits_min: Optional[float] = None
     credits_max: Optional[float] = None
+    days: Optional[str | list[str]] = None
+    start_after: Optional[str | time] = None
+    end_before: Optional[str | time] = None
     term_code: Optional[str] = None
     include_grouped: bool = False
 
@@ -187,9 +199,13 @@ class SectionSummary(_Model):
     course_type: Optional[str]
     instructors: list[str]
     meeting_summary: str     # e.g. "MW 14:00-15:15"; "" if no meetings
+    has_meetings: bool       # False: no scheduled meeting time (arranged)
     max_enrollment: Optional[int]
     enrolled: Optional[int]
     open_seats: Optional[int]
+    permission_required: Optional[bool]
+    restrictions: Optional[str]      # Rice's raw restriction text
+    enrollment_as_of: Optional[datetime]   # when Rice reported the counts
     score: Optional[float] = None   # search rank; None outside search
 
 
@@ -291,3 +307,22 @@ class Subject(_Model):
 class DistributionGroup(_Model):
     name: str
     active_sections: int
+
+
+@dataclass(frozen=True)
+class DataFreshness(_Model):
+    """How current a term's data is.
+
+    ``enrollment_as_of_*`` are Rice's own timestamps for the enrollment
+    numbers, the honest "data as of" time. ``loaded_at`` is when rows were
+    last written to our database, which can be much later than the real
+    fetch (the loader also re-reads cached pages), so do not present it as
+    the freshness of the data.
+    """
+
+    term_code: Optional[str]
+    term_label: Optional[str]
+    active_sections: int
+    enrollment_as_of_min: Optional[datetime]
+    enrollment_as_of_max: Optional[datetime]
+    loaded_at: Optional[datetime]

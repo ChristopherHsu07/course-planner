@@ -14,11 +14,8 @@ from typing import Any, Optional, Sequence
 from .db import cursor, resolve_term
 from .models import (DAY_LETTERS, BusyBlock, Conflict, ConflictReport,
                      SectionFilters, SectionSummary, hhmm)
-from .sections import build_filter_clauses, query_summaries
-
-
-def _as_block(b: BusyBlock | dict) -> BusyBlock:
-    return b if isinstance(b, BusyBlock) else BusyBlock.from_dict(b)
+from .busy import coerce_blocks
+from .sections import search_sections
 
 
 def find_sections_avoiding(conn, busy_blocks: Sequence[BusyBlock | dict],
@@ -34,38 +31,9 @@ def find_sections_avoiding(conn, busy_blocks: Sequence[BusyBlock | dict],
     time) never conflicts and is included. An empty block list returns the
     filtered sections unchanged.
     """
-    blocks = [_as_block(b) for b in busy_blocks]
-    term = resolve_term(conn, filters.term_code if filters else None)
-    if term is None:
-        return []
-    clauses, params = build_filter_clauses(filters, term)
-
-    if blocks:
-        # Parallel arrays unnested row-by-row into a (day, start, end, ...)
-        # table. Casts are explicit so empty/NULL date arrays still type.
-        params.update(
-            b_days=[b.day_num for b in blocks],
-            b_starts=[b.start for b in blocks],
-            b_ends=[b.end for b in blocks],
-            b_sdates=[b.start_date for b in blocks],
-            b_edates=[b.end_date for b in blocks],
-        )
-        clauses.append("""NOT EXISTS (
-            SELECT 1 FROM meetings m
-            JOIN unnest(%(b_days)s::smallint[], %(b_starts)s::time[],
-                        %(b_ends)s::time[], %(b_sdates)s::date[],
-                        %(b_edates)s::date[])
-                 AS b(day, start_t, end_t, sdate, edate)
-              ON m.day_of_week = b.day
-            WHERE m.term_code = s.term_code AND m.crn = s.crn
-              AND m.start_time < b.end_t AND b.start_t < m.end_time
-              AND (b.sdate IS NULL OR m.end_date   IS NULL OR m.end_date   >= b.sdate)
-              AND (b.edate IS NULL OR m.start_date IS NULL OR m.start_date <= b.edate)
-        )""")
-
-    return query_summaries(
-        conn, clauses, params, limit=limit,
-        order_by="s.subject_code, s.course_number, s.section_no")
+    # The query itself is search_sections with no text and the blocks applied.
+    return search_sections(conn, None, filters, limit,
+                           busy_blocks=coerce_blocks(busy_blocks))
 
 
 def check_schedule_conflicts(conn, crns: Sequence[str],

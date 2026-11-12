@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from .db import cursor, resolve_term
-from .models import DistributionGroup, Subject
+from .models import DataFreshness, DistributionGroup, Subject
 
 
 def list_subjects(conn, term_code: Optional[str] = None) -> list[Subject]:
@@ -47,3 +47,44 @@ def list_distribution_groups(conn, term_code: Optional[str] = None
             "GROUP BY 1 ORDER BY 1", (term,))
         return [DistributionGroup(name=r["name"], active_sections=r["n"])
                 for r in cur.fetchall()]
+
+
+def term_label(term_code: Optional[str]) -> Optional[str]:
+    """Human name of a Rice term code: ``"202720"`` -> ``"Spring 2027"``.
+
+    Rice codes are the academic-year-ending year plus ``10`` (Fall of the
+    previous calendar year), ``20`` (Spring) or ``30`` (Summer). Anything
+    else comes back unchanged.
+    """
+    if not term_code:
+        return term_code
+    code = str(term_code)
+    if len(code) == 6 and code.isdigit():
+        year, suffix = int(code[:4]), code[4:]
+        if suffix == "10":
+            return f"Fall {year - 1}"
+        if suffix == "20":
+            return f"Spring {year}"
+        if suffix == "30":
+            return f"Summer {year}"
+    return code
+
+
+def get_data_freshness(conn, term_code: Optional[str] = None) -> DataFreshness:
+    """Term label, section count and data timestamps for ``term_code``.
+
+    Defaults to the latest active term. Report ``enrollment_as_of_min`` (the
+    oldest enrollment number in the term) as the data's age; see
+    ``DataFreshness`` for why ``loaded_at`` is not that.
+    """
+    term = resolve_term(conn, term_code)
+    with cursor(conn) as cur:
+        cur.execute(
+            "SELECT count(*)::int AS n, min(enrollment_as_of) AS lo, "
+            "max(enrollment_as_of) AS hi, max(scraped_at) AS loaded "
+            "FROM sections WHERE is_active AND term_code = %s", (term,))
+        r = cur.fetchone()
+    return DataFreshness(
+        term_code=term, term_label=term_label(term), active_sections=r["n"],
+        enrollment_as_of_min=r["lo"], enrollment_as_of_max=r["hi"],
+        loaded_at=r["loaded"])
