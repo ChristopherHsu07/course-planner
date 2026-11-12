@@ -43,6 +43,15 @@ from .util import format_as_of
 NO_MEETING = "NO SCHEDULED MEETING TIME"
 MAX_CRNS = 12
 
+# time_of_day -> (start_after, end_before). The code, not the model, decides
+# which bound a word means: a small model mixed up "start_after 12:00" with
+# "morning".
+TIME_OF_DAY = {
+    "morning": (None, "12:00"),
+    "afternoon": ("12:00", "17:00"),
+    "evening": ("17:00", None),
+}
+
 
 class ArgError(ValueError):
     """A tool argument is missing or has the wrong type."""
@@ -72,8 +81,9 @@ _TOOLS = [
         "Search class sections for the current term by topic words, a "
         "course code such as 'COMP 140', or filters alone. Matches meaning "
         "as well as keywords. The student's busy times are already applied "
-        "automatically. Use days / start_after / end_before only for when "
-        "the student WANTS the class to meet (e.g. 'MWF mornings').",
+        "automatically. Use days and time_of_day (or start_after / "
+        "end_before for exact times) only for when the student WANTS the "
+        "class to meet, e.g. days='MWF' and time_of_day='morning'.",
         {"query": {**_S, "description": "topic words or a course code; "
                    "leave out to list by filters only"},
          "subject": {**_S, "description": "subject code, e.g. COMP, MATH"},
@@ -90,12 +100,20 @@ _TOOLS = [
                   "days the student WANTS the class to meet, as letters "
                   "M T W R F S U (R = Thursday), e.g. 'MWF' or 'TR'. Only "
                   "sections meeting entirely on these days are returned."},
+         "time_of_day": {"type": "string",
+                         "enum": list(TIME_OF_DAY), "description":
+                         "when the student WANTS the class: 'morning' "
+                         "(ends by 12:00), 'afternoon' (12:00-17:00) or "
+                         "'evening' (starts 17:00 or later). Prefer this "
+                         "over start_after / end_before."},
          "start_after": {**_S, "description":
-                         "24-hour HH:MM; only sections that start at or "
-                         "after this time, e.g. '13:00' for afternoons"},
+                         "only for an exact time the student gave: 24-hour "
+                         "HH:MM; sections starting at or AFTER it "
+                         "('after 1pm' -> '13:00')"},
          "end_before": {**_S, "description":
-                        "24-hour HH:MM; only sections that end at or before "
-                        "this time, e.g. '12:00' for mornings"},
+                        "only for an exact time the student gave: 24-hour "
+                        "HH:MM; sections ending at or BEFORE it "
+                        "('done by 3pm' -> '15:00')"},
          "limit": {**_I, "description":
                    f"results to return, default {config.MAX_RESULTS}, "
                    f"max {config.MAX_RESULTS_CAP}"}}),
@@ -310,7 +328,39 @@ def _section_notes(rows: list[dict]) -> list[str]:
 # Handlers
 # --------------------------------------------------------------------------
 
+def _wanted_times(a: dict) -> tuple[Optional[str], Optional[str]]:
+    """``(start_after, end_before)`` from time_of_day and explicit times.
+
+    An explicit time overrides the matching bound of ``time_of_day``.
+    """
+    start_after, end_before = _str(a, "start_after"), _str(a, "end_before")
+    word = _str(a, "time_of_day")
+    if word:
+        key = word.lower()
+        if key not in TIME_OF_DAY:
+            raise ArgError(f"'time_of_day' must be one of "
+                           f"{', '.join(TIME_OF_DAY)}, got {word!r}")
+        default_start, default_end = TIME_OF_DAY[key]
+        start_after = start_after or default_start
+        end_before = end_before or default_end
+    return start_after, end_before
+
+
+def _describe_meeting_filters(f: SectionFilters) -> str:
+    """Readable summary, e.g. ``"days MWF; ends by 12:00"``."""
+    parts = []
+    if f.days:
+        days = f.days if isinstance(f.days, str) else "".join(f.days)
+        parts.append(f"days {days.upper()}")
+    if f.start_after:
+        parts.append(f"starts at or after {f.start_after}")
+    if f.end_before:
+        parts.append(f"ends by {f.end_before}")
+    return "; ".join(parts)
+
+
 def _search(conn, session: Session, a: dict) -> dict:
+    start_after, end_before = _wanted_times(a)
     filters = SectionFilters(
         subject=_str(a, "subject"),
         distribution_group=_str(a, "distribution_group"),
@@ -320,7 +370,7 @@ def _search(conn, session: Session, a: dict) -> dict:
         open_seats_only=_bool(a, "open_seats_only"),
         credits_min=_num(a, "credits_min"), credits_max=_num(a, "credits_max"),
         days=_str(a, "days"),
-        start_after=_str(a, "start_after"), end_before=_str(a, "end_before"),
+        start_after=start_after, end_before=end_before,
         term_code=session.term_code)
     limit = _int(a, "limit") or config.MAX_RESULTS
     limit = max(1, min(limit, config.MAX_RESULTS_CAP))
@@ -341,7 +391,8 @@ def _search(conn, session: Session, a: dict) -> dict:
                      "keyword matching only; related courses with different "
                      "wording may be missing.")
     if filters.days or filters.start_after or filters.end_before:
-        notes.append("Filtered to the requested meeting days/times; sections "
+        notes.append("Filtered to the requested meeting days/times ("
+                     f"{_describe_meeting_filters(filters)}); sections "
                      f"with {NO_MEETING} are left out because they cannot "
                      "be matched.")
     if truncated:
@@ -352,7 +403,8 @@ def _search(conn, session: Session, a: dict) -> dict:
     return _envelope(conn, session, results,
                      as_of=_min_as_of(s.enrollment_as_of for s in rows),
                      notes=notes, truncated=truncated,
-                     busy_times_applied=bool(session.busy_blocks))
+                     busy_times_applied=bool(session.busy_blocks),
+                     meeting_filters=_describe_meeting_filters(filters) or None)
 
 
 def _get_section(conn, session: Session, a: dict) -> dict:

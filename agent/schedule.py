@@ -106,7 +106,8 @@ _SCHEDULE_HINT = re.compile(
 # "Find me a class that meets MWF mornings" is about the class the student
 # WANTS, not times they are busy. It mentions days and "mornings", so it
 # would trip the hint above; this pair of patterns lets it through to the
-# search tool (which has days / start_after / end_before filters) instead.
+# search tool (which has days / time_of_day / start_after / end_before
+# filters) instead.
 _REQUEST = re.compile(
     r"\b(?:find|give me|show me|looking for|look for|recommend|suggest|"
     r"search for|list|are there|is there|do you have|i (?:want|need|would "
@@ -120,10 +121,25 @@ _BUSY_STATEMENT = re.compile(
     r"remove|instead)\b", re.IGNORECASE)
 
 
+# An exact clock time: "10:00", "2pm", "from 9", "10 to 11".
+_CLOCK_TIME = re.compile(
+    r"\d\s*[:.]\s*\d\d|\b\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.)|"
+    r"\b(?:before|after|between|from|until|till|at)\s+\d|"
+    r"\b\d{1,2}\s*(?:-|to)\s*\d{1,2}\b", re.IGNORECASE)
+
+
 def is_class_request(text: str) -> bool:
-    """True when ``text`` only asks for classes (no busy-time statement)."""
-    return bool(_REQUEST.search(text) and _CLASS_WORD.search(text)
-                and not _BUSY_STATEMENT.search(text))
+    """True when ``text`` asks for classes and says nothing about being busy.
+
+    It needs a class word ("class", "course", ...) and no busy-time
+    statement ("I have", "I work", "busy", ...), plus either a request verb
+    ("find", "give me", ...) or no exact clock time. The second case covers
+    "asian studies class in the morning on MWF", which has no verb; a terse
+    "class Monday 10 to 11am" has exact times, so it is still read as busy.
+    """
+    return bool(_CLASS_WORD.search(text)
+                and not _BUSY_STATEMENT.search(text)
+                and (_REQUEST.search(text) or not _CLOCK_TIME.search(text)))
 
 
 def looks_like_schedule(text: str) -> bool:

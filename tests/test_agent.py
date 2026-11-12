@@ -348,8 +348,11 @@ def test_class_request_does_not_become_busy_blocks(conn, session):
 
 
 def test_prompt_tells_the_model_wanted_times_are_filters(conn):
-    prompt = build_system_prompt("202720", [])
-    assert "start_after" in prompt and "not busy times" in prompt
+    prompt = " ".join(build_system_prompt("202720", []).split())
+    assert "time_of_day" in prompt and "not busy times" in prompt
+    # It says which bound is which, so "morning" cannot be read backwards.
+    assert "start_after means the class starts at or after" in prompt
+    assert "end_before means it ends at or before" in prompt
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -365,6 +368,12 @@ def test_prompt_tells_the_model_wanted_times_are_filters(conn):
      "monday wednesday and friday", False),
     ("Find me classes that meet MWF mornings", False),
     ("are there any courses on Tuesday afternoons?", False),
+    # No request verb at all, as typed in the real chat.
+    ("asian studies class in the morning of Monday Wednesday Friday", False),
+    ("computer science course Tuesday Thursday afternoons", False),
+    # A terse statement with exact times is still a busy time.
+    ("class Monday 10 to 11am", True),
+    ("class M 08:00-08:50", True),
     # ...unless the same message also says when the student is busy.
     ("I have class Monday 10:00 to 11:15. Find open CS courses", True),
     ("Find a class on Fridays, I also work Mondays 1-5pm", True),
@@ -607,6 +616,59 @@ def test_search_tool_filters_by_wanted_days_and_times(conn):
     assert "busy_blocks" not in json.dumps(tool_definitions())
     params = tool_definitions()[0]["function"]["parameters"]["properties"]
     assert {"days", "start_after", "end_before"} <= set(params)
+
+
+def _meeting_spans(env):
+    """``[(letters, start, end), ...]`` for every meeting in a search result."""
+    spans = []
+    for r in env["results"]:
+        for part in r["meetings"].split("; "):
+            letters, span = part.split()
+            start, end = span.split("-")
+            spans.append((letters, start, end))
+    return spans
+
+
+def test_time_of_day_morning_means_ends_by_noon(conn):
+    env = dispatch(conn, Session(), "search_sections", {
+        "days": "MWF", "time_of_day": "morning", "limit": 15})
+    assert env["count"] > 0
+    assert all(end <= "12:00" for _, _, end in _meeting_spans(env))
+    assert env["meeting_filters"] == "days MWF; ends by 12:00"
+    assert any("ends by 12:00" in n for n in env["notes"])
+
+
+def test_time_of_day_afternoon_and_evening(conn):
+    aft = dispatch(conn, Session(), "search_sections",
+                   {"time_of_day": "Afternoon", "limit": 15})   # any case
+    assert aft["count"] > 0
+    assert all("12:00" <= s and e <= "17:00"
+               for _, s, e in _meeting_spans(aft))
+    eve = dispatch(conn, Session(), "search_sections",
+                   {"time_of_day": "evening", "limit": 15})
+    assert eve["count"] > 0
+    assert all(s >= "17:00" for _, s, _ in _meeting_spans(eve))
+    assert eve["meeting_filters"] == "starts at or after 17:00"
+
+
+def test_explicit_time_overrides_that_side_of_time_of_day(conn):
+    env = dispatch(conn, Session(), "search_sections", {
+        "time_of_day": "morning", "end_before": "10:30", "limit": 15})
+    assert env["meeting_filters"] == "ends by 10:30"
+    assert all(end <= "10:30" for _, _, end in _meeting_spans(env))
+
+
+def test_bad_time_of_day_is_a_tool_error_and_no_filter_means_no_echo(conn):
+    err = dispatch(conn, Session(), "search_sections",
+                   {"time_of_day": "midnight"})
+    assert "time_of_day" in err["error"] and "morning" in err["error"]
+    plain = dispatch(conn, Session(), "search_sections", {"subject": "COMP"})
+    assert plain["meeting_filters"] is None
+
+
+def test_time_of_day_is_in_the_tool_schema_with_fixed_values():
+    props = tool_definitions()[0]["function"]["parameters"]["properties"]
+    assert props["time_of_day"]["enum"] == ["morning", "afternoon", "evening"]
 
 
 def test_bad_wanted_time_is_a_tool_error(conn):
