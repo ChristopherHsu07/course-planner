@@ -25,14 +25,16 @@ Design rules enforced here, not left to the model:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from services import (SectionDetail, SectionFilters, SectionSummary,
                       check_schedule_conflicts, get_course_sections,
                       get_section, list_distribution_groups, list_subjects,
                       search_sections, seat_status, term_label)
 from services.db import resolve_term
+from services.models import Subject
 from services.sections import format_meeting_summary
 
 from . import config
@@ -86,7 +88,10 @@ _TOOLS = [
         "class to meet, e.g. days='MWF' and time_of_day='morning'.",
         {"query": {**_S, "description": "topic words or a course code; "
                    "leave out to list by filters only"},
-         "subject": {**_S, "description": "subject code, e.g. COMP, MATH"},
+         "subject": {**_S, "description":
+                     "department: a code (COMP, ASIA) or its name ('Asian "
+                     "Studies'). Use this, not query, when the student "
+                     "names a department."},
          "distribution_group": {**_S, "description":
                                 "e.g. 'Distribution Group I' (or 'I')"},
          "method": {**_S, "description": "e.g. 'Face to Face', 'Online'"},
@@ -359,10 +364,95 @@ def _describe_meeting_filters(f: SectionFilters) -> str:
     return "; ".join(parts)
 
 
+_FILLER_WORDS = {"a", "an", "the", "any", "some", "in", "of", "for", "class",
+                 "classes", "course", "courses", "section", "sections",
+                 "department", "dept", "subject", "offered", "offerings"}
+
+
+def _norm(text: str) -> str:
+    """Lowercase words only: ``"Asian  Studies!"`` -> ``"asian studies"``."""
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
+def resolve_subject_text(text: str, subjects: Sequence[Subject]
+                         ) -> Optional[Subject]:
+    """The subject named by ``text``, or ``None``.
+
+    Matches a subject code (``"asia"``) or its full name (``"Asian
+    Studies"``), ignoring case, punctuation and filler words such as
+    "classes" or "department". Only a whole-text match counts, so "history
+    of science" is not turned into HIST.
+    """
+    words = [w for w in _norm(text).split() if w not in _FILLER_WORDS]
+    if not words:
+        return None
+    key = " ".join(words)
+    for s in subjects:
+        if key == s.code.lower() or key == _norm(s.name):
+            return s
+    return None
+
+
+def _resolve_subjects(conn, session: Session, a: dict
+                      ) -> tuple[Optional[list[str]], Optional[str], list[str]]:
+    """Work out ``(subject codes, query, notes)`` for a search.
+
+    A ``subject`` argument may be a code or a department name (the model
+    often passes "Asian Studies"); an unknown one is an error that lists the
+    valid subjects, so the model can retry. With no ``subject``, a query that
+    is nothing but a department name ("asian studies classes") becomes a
+    subject filter and no keyword query, since the words of a department's
+    name rarely appear in its course titles.
+    """
+    subjects = list_subjects(conn, session.term_code)
+    query = _str(a, "query")
+    raw = _str(a, "subject")
+    notes: list[str] = []
+    chosen: list[Subject] = []
+
+    if raw:
+        # A whole name first ("Music and Dance"), then a list of them.
+        parts = ([raw] if resolve_subject_text(raw, subjects)
+                 else re.split(r"[,/;&]|\band\b", raw))
+        for part in parts:
+            if not part.strip():
+                continue
+            found = resolve_subject_text(part, subjects)
+            if found is None:
+                valid = ", ".join(f"{s.code} ({s.name})" for s in subjects
+                                  if s.active_sections > 0)
+                raise ArgError(f"unknown subject {part.strip()!r}. Subjects "
+                               f"with sections this term: {valid}")
+            if found not in chosen:
+                chosen.append(found)
+            if _norm(part) != found.code.lower():
+                notes.append(f"Read subject {part.strip()!r} as {found.code} "
+                             f"({found.name}).")
+        if query:                       # "asian studies" with subject=ASIA
+            same = resolve_subject_text(query, subjects)
+            if same is not None and same in chosen:
+                query = None
+    elif query:
+        found = resolve_subject_text(query, subjects)
+        if found is not None:
+            chosen.append(found)
+            query = None
+            notes.append(f"Read {_str(a, 'query')!r} as the subject "
+                         f"{found.code} ({found.name}); listing its sections.")
+
+    empty = [s.code for s in chosen if s.active_sections == 0]
+    if empty:
+        notes.append(f"No sections of {', '.join(empty)} are loaded for this "
+                     "term (not offered, or not loaded yet); say so rather "
+                     "than guessing.")
+    return ([s.code for s in chosen] or None), query, notes
+
+
 def _search(conn, session: Session, a: dict) -> dict:
     start_after, end_before = _wanted_times(a)
+    subject_codes, query, subject_notes = _resolve_subjects(conn, session, a)
     filters = SectionFilters(
-        subject=_str(a, "subject"),
+        subject=subject_codes,
         distribution_group=_str(a, "distribution_group"),
         method=_str(a, "method"),
         level_min=_int(a, "level_min"), level_max=_int(a, "level_max"),
@@ -375,7 +465,7 @@ def _search(conn, session: Session, a: dict) -> dict:
     limit = _int(a, "limit") or config.MAX_RESULTS
     limit = max(1, min(limit, config.MAX_RESULTS_CAP))
     semantic = config.SEMANTIC and not config.SEMANTIC_LOADING
-    rows = search_sections(conn, _str(a, "query"), filters, limit=limit + 1,
+    rows = search_sections(conn, query, filters, limit=limit + 1,
                            mode="auto" if semantic else "keyword",
                            busy_blocks=session.busy_blocks)
     truncated = len(rows) > limit
@@ -386,7 +476,8 @@ def _search(conn, session: Session, a: dict) -> dict:
         notes.insert(0, f"Results already exclude sections that overlap the "
                         f"student's {len(session.busy_blocks)} busy time "
                         "block(s).")
-    if config.SEMANTIC and config.SEMANTIC_LOADING and _str(a, "query"):
+    notes.extend(subject_notes)
+    if config.SEMANTIC and config.SEMANTIC_LOADING and query:
         notes.append("Meaning-based search is still loading, so this used "
                      "keyword matching only; related courses with different "
                      "wording may be missing.")

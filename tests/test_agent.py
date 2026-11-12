@@ -25,9 +25,11 @@ from agent.llm import LLMError, OllamaClient
 from agent.prompts import build_system_prompt
 from agent.schedule import extract_busy_blocks, looks_like_schedule
 from agent.session import Session
-from agent.tools import NO_MEETING, dispatch, record_seen, tool_definitions
+from agent.tools import (NO_MEETING, dispatch, record_seen,
+                         resolve_subject_text, tool_definitions)
 from agent.util import format_as_of
 from services import BusyBlock, SectionFilters, search_sections
+from services.models import Subject
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
@@ -669,6 +671,100 @@ def test_bad_time_of_day_is_a_tool_error_and_no_filter_means_no_echo(conn):
 def test_time_of_day_is_in_the_tool_schema_with_fixed_values():
     props = tool_definitions()[0]["function"]["parameters"]["properties"]
     assert props["time_of_day"]["enum"] == ["morning", "afternoon", "evening"]
+
+
+FAKE_SUBJECTS = [Subject("ASIA", "Asian Studies", 14),
+                 Subject("COMP", "Computer Science", 214),
+                 Subject("HIST", "History", 46),
+                 Subject("MUSI", "Music", 30)]
+
+
+@pytest.mark.parametrize("text,code", [
+    ("Asian Studies", "ASIA"), ("asian studies", "ASIA"), ("ASIA", "ASIA"),
+    ("asia", "ASIA"), ("Computer Science", "COMP"), ("comp", "COMP"),
+    ("computer-science!", "COMP"), ("the history department", "HIST"),
+    ("asian studies classes", "ASIA"), ("any music courses", "MUSI"),
+])
+def test_resolve_subject_text_matches_codes_and_names(text, code):
+    assert resolve_subject_text(text, FAKE_SUBJECTS).code == code
+
+
+@pytest.mark.parametrize("text", [
+    "history of science",           # a topic that merely contains a name
+    "computer science and poetry", "asian", "COMP 140", "poetry", "classes",
+    "", "the",
+])
+def test_resolve_subject_text_ignores_everything_else(text):
+    assert resolve_subject_text(text, FAKE_SUBJECTS) is None
+
+
+def _subjects_in(env):
+    return {r["subject"] for r in env["results"]}
+
+
+def test_department_name_in_subject_argument_is_mapped_to_its_code(conn):
+    env = dispatch(conn, Session(), "search_sections",
+                   {"subject": "Asian Studies", "limit": 15})
+    assert env["count"] > 0 and _subjects_in(env) == {"ASIA"}
+    assert any("ASIA" in n and "Asian Studies" in n for n in env["notes"])
+    # A plain code needs no note.
+    plain = dispatch(conn, Session(), "search_sections",
+                     {"subject": "asia", "limit": 15})
+    assert _subjects_in(plain) == {"ASIA"}
+    assert not any("Read subject" in n for n in plain["notes"])
+
+
+def test_department_name_in_query_becomes_a_subject_filter(conn):
+    """The 'asian studies' bug: the words are not in the course titles."""
+    env = dispatch(conn, Session(), "search_sections",
+                   {"query": "asian studies classes", "limit": 15})
+    assert env["count"] > 0 and _subjects_in(env) == {"ASIA"}
+    assert any("as the subject ASIA" in n for n in env["notes"])
+    both = dispatch(conn, Session(), "search_sections",
+                    {"query": "Asian Studies", "subject": "ASIA", "limit": 15})
+    assert crns_of(both) == crns_of(env)    # the query was dropped, not ANDed
+
+
+def test_topic_queries_are_left_alone(conn):
+    env = dispatch(conn, Session(), "search_sections",
+                   {"query": "poetry", "subject": "ENGL", "limit": 5})
+    assert env["count"] > 0 and not any("subject" in n.lower()
+                                        for n in env["notes"])
+
+
+def test_several_departments_in_one_argument(conn):
+    env = dispatch(conn, Session(), "search_sections",
+                   {"subject": "COMP, math", "limit": 15,
+                    "level_min": 200, "level_max": 399})
+    assert _subjects_in(env) <= {"COMP", "MATH"}
+    both = dispatch(conn, Session(), "search_sections", {
+        "subject": "Computer Science and Mathematics", "limit": 15})
+    assert _subjects_in(both) <= {"COMP", "MATH"}
+
+
+def test_unknown_subject_is_an_error_that_lists_valid_ones(conn):
+    err = dispatch(conn, Session(), "search_sections",
+                   {"subject": "Underwater Basket Weaving"})
+    assert "unknown subject" in err["error"]
+    assert "ASIA (Asian Studies)" in err["error"]
+
+
+def test_known_subject_with_no_sections_loaded_is_flagged(conn):
+    from services import list_subjects
+    empty = [s for s in list_subjects(conn) if s.active_sections == 0]
+    if not empty:
+        pytest.skip("every known subject has sections loaded")
+    env = dispatch(conn, Session(), "search_sections",
+                   {"subject": empty[0].code})
+    assert env["count"] == 0
+    assert any("No sections of" in n and "loaded" in n for n in env["notes"])
+
+
+def test_prompt_and_schema_steer_departments_to_subject():
+    prompt = " ".join(build_system_prompt("202720", []).split())
+    assert "subject argument" in prompt and "not in query" in prompt
+    props = tool_definitions()[0]["function"]["parameters"]["properties"]
+    assert "department" in props["subject"]["description"]
 
 
 def test_bad_wanted_time_is_a_tool_error(conn):
